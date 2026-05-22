@@ -436,6 +436,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ScheduleBatch,
         model_runner: ModelRunner,
     ):
+        """Compose snapshot + runtime attach."""
+        fb = cls.from_schedule_batch(batch, model_runner)
+        fb.attach_runtime(batch, model_runner)
+        return fb
+
+    @classmethod
+    def from_schedule_batch(
+        cls,
+        batch: ScheduleBatch,
+        model_runner: ModelRunner,
+    ) -> "ForwardBatch":
+        """Build a forward-ready snapshot of `batch`: CPU fields, H2D for derived
+        inputs, positions, and global_num_tokens. No model_runner-bound manager
+        calls (LoRA / ngram / mrope) — those are deferred to `attach_runtime`.
+        """
         # Consume one-shot per-forward overrides from SB; reset to defaults so
         # the next forward on the same SB starts clean. See SB field comment
         # for the contract.
@@ -458,25 +473,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 capture_hidden_mode = CaptureHiddenMode.NULL
 
-        # extend-mode-only fields are None on decode/idle
-        if batch.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-        else:
-            extend_seq_lens = batch.extend_lens
-            extend_prefix_lens = batch.prefix_lens
-            extend_logprob_start_lens = batch.extend_logprob_start_lens
-
-        # Mirror the grammars-population behavior previously done in
-        # ScheduleBatch.get_model_worker_batch.
         if batch.sampling_info is not None:
             if batch.has_grammar:
                 batch.sampling_info.grammars = [req.grammar for req in batch.reqs]
             else:
                 batch.sampling_info.grammars = None
 
-        # ScheduleBatch.sampling_info is already swapped to the forward-only
-        # copy by Scheduler.run_batch under overlap mode (see save/restore
-        # block there). Use it directly.
         if seq_lens_cpu_cache is not None:
             # Stale-cache guard: shape must match current GPU seq_lens. Mismatch
             # means caller forgot to refresh the override after batch size
@@ -557,7 +559,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.global_num_tokens is not None:
             assert batch.global_num_tokens_for_logprob is not None
 
-            # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
                 spec_info: SpecInput = batch.spec_info
                 global_num_tokens, global_num_tokens_for_logprob = (
@@ -582,7 +583,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
-        # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
@@ -601,11 +601,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             ret.positions = ret.spec_info.positions
 
-        # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            extend_seq_lens = batch.extend_lens
+            extend_prefix_lens = batch.prefix_lens
             assert isinstance(extend_seq_lens, list)
             assert isinstance(extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32).to(
@@ -625,30 +626,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = extend_prefix_lens
             ret.extend_seq_lens_cpu = extend_seq_lens
-            ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+        return ret
+
+    def attach_runtime(self, batch: ScheduleBatch, model_runner: ModelRunner) -> None:
+        """Invoke model_runner-bound managers (LoRA / ngram / mrope)
+        flag-gated by server config. Idle batches skip all of these.
+        """
+        if self.forward_mode.is_idle():
+            return
+
+        device = model_runner.device
 
         if model_runner.use_ngram_embedding:
-            ret._init_ngram_embedding_info(batch, device)
+            self._init_ngram_embedding_info(batch, device)
 
         if model_runner.model_is_mrope:
             if (
-                ret.spec_info is not None
-                and getattr(ret.spec_info, "positions", None) is not None
+                self.spec_info is not None
+                and getattr(self.spec_info, "positions", None) is not None
             ):
-                ret.compute_spec_mrope_positions(model_runner, batch)
+                self.compute_spec_mrope_positions(model_runner, batch)
             else:
-                ret._compute_mrope_positions(model_runner, batch)
+                self._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
         if model_runner.server_args.enable_lora:
-            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
-            # as a batch, right before running the batch
+            # In the non-LoRA overlap loading case, fetch LoRA adapters into the
+            # memory pool as a batch right before running the batch.
             if not model_runner.server_args.enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.fetch_new_loras(set(self.lora_ids))
 
-            model_runner.lora_manager.prepare_lora_batch(ret)
-
-        return ret
+            model_runner.lora_manager.prepare_lora_batch(self)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
