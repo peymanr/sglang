@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -1155,6 +1157,50 @@ def _eplb_remap_enabled() -> bool:
     )
 
 
+@triton.jit
+def _fill_padded_rows_kernel(
+    out_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        tl.store(out_ptr + row * stride_row + cols, fill_value, mask=mask)
+
+
+def _can_fuse_padded_region(x: torch.Tensor) -> bool:
+    return x.dim() == 2 and x.stride(1) == 1
+
+
+def _fill_padded_rows(
+    x: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    fill_value,
+) -> None:
+    if num_token_non_padded.numel() != 1:
+        raise ValueError("num_token_non_padded must be a single-element tensor")
+    if num_token_non_padded.is_floating_point():
+        raise ValueError("num_token_non_padded must be an integer tensor")
+    if num_token_non_padded.device != x.device:
+        raise ValueError("num_token_non_padded must be on the same device as x")
+    n_rows, n_cols = x.shape
+    BLOCK_COLS = triton.next_power_of_2(n_cols)
+    _fill_padded_rows_kernel[(n_rows,)](
+        x,
+        num_token_non_padded,
+        n_cols,
+        fill_value,
+        x.stride(0),
+        BLOCK_COLS=BLOCK_COLS,
+    )
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -1165,6 +1211,8 @@ def _mask_topk_ids_padded_region(
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
+    elif _can_fuse_padded_region(topk_ids):
+        _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     elif _is_npu:
         # On NPU, bool-indexed scatter `topk_ids[bool_mask, :] = -1` lowers
         # to aclnnNonzeroV2 and can trigger an aicore timeout under long
@@ -1182,6 +1230,9 @@ def _zero_topk_weights_padded_region(
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     if num_token_non_padded is None:
+        return
+    if _can_fuse_padded_region(topk_weights):
+        _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
     indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
     topk_weights[indices >= num_token_non_padded, :] = 0.0
